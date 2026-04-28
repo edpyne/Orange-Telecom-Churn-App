@@ -553,12 +553,10 @@ def main():
             c2.metric("High Risk",   f"{(results['risk_level']=='High Risk').sum():,}")
             c3.metric("Medium Risk", f"{(results['risk_level']=='Medium Risk').sum():,}")
 
-            risk_counts = (results["risk_level"]
-                           .value_counts().reset_index()
-                           .rename(columns={"index": "Risk Level",
-                                            "risk_level": "Count"}))
-            if "risk_level" in risk_counts.columns and "Count" not in risk_counts.columns:
-                risk_counts.columns = ["Risk Level", "Count"]
+            # pandas-version-agnostic: always produces "Risk Level" / "Count"
+            _vc = results["risk_level"].value_counts().reset_index()
+            _vc.columns = ["Risk Level", "Count"]
+            risk_counts = _vc
 
             cmap = {"Low Risk": "#10b981", "Medium Risk": "#f59e0b",
                     "High Risk": "#ef4444"}
