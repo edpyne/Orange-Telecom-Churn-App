@@ -44,14 +44,23 @@ st.set_page_config(
 # ─────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────
-# Resolve paths relative to this script so the app works
-# regardless of working directory (local, Streamlit Cloud, Colab).
 _HERE      = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(_HERE, "model.pkl")
 DATA_PATH  = os.path.join(_HERE, "Orange_Telecom_Churn_Data.csv")
 TARGET_COL = "churned"
 DROP_COLS  = ["phone_number"]
 RANDOM_SEED = 42
+
+# Columns the batch CSV must contain (raw, before feature engineering)
+REQUIRED_BATCH_COLS = [
+    "state", "account_length", "area_code", "intl_plan", "voice_mail_plan",
+    "number_vmail_messages",
+    "total_day_minutes",   "total_day_calls",   "total_day_charge",
+    "total_eve_minutes",   "total_eve_calls",   "total_eve_charge",
+    "total_night_minutes", "total_night_calls", "total_night_charge",
+    "total_intl_minutes",  "total_intl_calls",  "total_intl_charge",
+    "number_customer_service_calls",
+]
 
 RISK_BANDS = {
     "Low Risk":    (0.00, 0.40, "#10b981", "🟢"),
@@ -276,7 +285,6 @@ def _train() -> dict:
         "cat_cols":   cat_cols,
         "data_stats": _compute_stats(df_raw),
     }
-    # Attempt to cache to disk (skips silently on read-only FS)
     try:
         with open(MODEL_PATH, "wb") as f:
             pickle.dump(artefacts, f)
@@ -286,7 +294,7 @@ def _train() -> dict:
 
 
 # ─────────────────────────────────────────────────────────
-# LOAD OR TRAIN (cached for the entire Streamlit session)
+# LOAD OR TRAIN
 # ─────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def load_or_train_model() -> dict:
@@ -430,14 +438,31 @@ def shap_bar_chart(shap_df: pd.DataFrame, dark: bool,
 
 
 # ─────────────────────────────────────────────────────────
-# BATCH PREDICTION
+# BATCH PREDICTION  (fixed: validates columns before predict)
 # ─────────────────────────────────────────────────────────
 def batch_predict(pipeline, df_upload: pd.DataFrame) -> pd.DataFrame:
-    df_c = df_upload.drop(
-        columns=[c for c in DROP_COLS if c in df_upload.columns],
-        errors="ignore")
-    if TARGET_COL in df_c.columns:
-        df_c = df_c.drop(columns=[TARGET_COL])
+    # Normalise column names: strip whitespace and lowercase so headers
+    # like "Total_Day_Charge" or " state " still match.
+    df_c = df_upload.copy()
+    df_c.columns = df_c.columns.str.strip().str.lower()
+
+    # Drop identifier / target columns if present
+    df_c = df_c.drop(
+        columns=[c for c in DROP_COLS + [TARGET_COL] if c in df_c.columns],
+        errors="ignore",
+    )
+
+    # ── Validate required columns ────────────────────────
+    missing = [c for c in REQUIRED_BATCH_COLS if c not in df_c.columns]
+    if missing:
+        missing_str = "\n".join(f"  • {c}" for c in missing)
+        raise ValueError(
+            f"Your CSV is missing **{len(missing)} required column(s)**:\n\n"
+            f"{missing_str}\n\n"
+            "Make sure the file has the same column names as the training data.\n"
+            "Column names are case-insensitive and leading/trailing spaces are ignored."
+        )
+
     probs  = pipeline.predict_proba(engineer_features(df_c))[:, 1]
     df_out = df_upload.copy()
     df_out["churn_probability_%"] = (probs * 100).round(2)
@@ -453,14 +478,13 @@ def batch_predict(pipeline, df_upload: pd.DataFrame) -> pd.DataFrame:
 # MAIN
 # ─────────────────────────────────────────────────────────
 def main():
-    # ── Auto-train banner (shown only when pkl is absent) ─
     first_run = not os.path.exists(MODEL_PATH)
     if first_run:
         _banner = st.warning(
             "⚙️  **First-run setup** — training the LightGBM model "
             "(≈ 30 s on Streamlit Cloud)…  Please wait.")
 
-    artefacts = load_or_train_model()   # ← trains if needed
+    artefacts = load_or_train_model()
 
     if first_run:
         _banner.empty()
@@ -491,6 +515,10 @@ def main():
         st.metric("Training Samples", "5,000")
         st.markdown("---")
         st.markdown("### 📂 Batch Prediction")
+        st.caption(
+            "Upload a CSV with these columns:\n"
+            + ", ".join(f"`{c}`" for c in REQUIRED_BATCH_COLS)
+        )
         uploaded_file = st.file_uploader(
             "Upload CSV for batch scoring", type=["csv"],
             help="Must contain the same columns as the training data.")
@@ -525,13 +553,10 @@ def main():
             c2.metric("High Risk",   f"{(results['risk_level']=='High Risk').sum():,}")
             c3.metric("Medium Risk", f"{(results['risk_level']=='Medium Risk').sum():,}")
 
-            risk_counts = (results["risk_level"]
-                           .value_counts().reset_index()
-                           .rename(columns={"index": "Risk Level",
-                                            "risk_level": "Count"}))
-            # handle both old/new pandas column naming
-            if "risk_level" in risk_counts.columns and "Count" not in risk_counts.columns:
-                risk_counts.columns = ["Risk Level", "Count"]
+            # pandas-version-agnostic: always produces "Risk Level" / "Count"
+            _vc = results["risk_level"].value_counts().reset_index()
+            _vc.columns = ["Risk Level", "Count"]
+            risk_counts = _vc
 
             cmap = {"Low Risk": "#10b981", "Medium Risk": "#f59e0b",
                     "High Risk": "#ef4444"}
@@ -555,6 +580,20 @@ def main():
                 file_name="churn_predictions.csv",
                 mime="text/csv",
             )
+        except ValueError as exc:
+            # Show the missing-columns message clearly, not as a traceback
+            st.error(str(exc))
+            st.info(
+                "💡 **Tip:** Download the template below to see the exact "
+                "column names your CSV needs."
+            )
+            template = pd.DataFrame(columns=REQUIRED_BATCH_COLS)
+            st.download_button(
+                "⬇️  Download Column Template CSV",
+                data=template.to_csv(index=False).encode(),
+                file_name="batch_template.csv",
+                mime="text/csv",
+            )
         except Exception as exc:
             st.error(f"Batch prediction failed: {exc}")
         st.markdown("---")
@@ -573,7 +612,6 @@ def main():
     if "customer_df" not in st.session_state:
         st.session_state.customer_df = None
 
-    # Helper to safely pull stats bounds
     def _num(col, key, fallback):
         return stats.get(col, {}).get(key, fallback)
 
@@ -713,7 +751,6 @@ def main():
     if st.session_state.customer_df is not None:
         df_cust = st.session_state.customer_df
 
-        # ── Profile grid ──────────────────────────────────
         st.markdown("---")
         st.markdown('<p class="section-header">👤 Customer Summary</p>',
                     unsafe_allow_html=True)
@@ -735,7 +772,6 @@ def main():
         for i, (lbl, val) in enumerate(fields):
             pc[i % 4].metric(lbl, val)
 
-        # ── Prediction ────────────────────────────────────
         prob, df_feat = predict(pipeline, df_cust)
 
         risk_label, risk_color, risk_emoji = "Low Risk", "#10b981", "🟢"
@@ -787,7 +823,6 @@ def main():
                 except Exception as exc:
                     st.warning(f"SHAP skipped: {exc}")
 
-        # ── Insights ──────────────────────────────────────
         st.markdown("---")
         st.markdown("## 🔍 Churn Insights & Explainability")
         il, ir = st.columns([1.1, 0.9])
@@ -870,7 +905,6 @@ def main():
                          ].rename(columns={"shap": "SHAP Value"}),
                     use_container_width=True)
 
-    # ── Footer ────────────────────────────────────────────
     st.markdown("---")
     st.markdown(
         f'<p style="text-align:center;color:#64748b;font-size:0.82rem;">'
